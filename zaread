@@ -1,66 +1,248 @@
-#!/bin/bash
+#!/bin/sh
 ## zaread - a simple script created by paoloap.
 
-# default variables
-zadir="$HOME"'/.zaread/'
-reader="zathura"
+# Exit codes:
+#   1 - usage error, missing file, or missing dependency
+#   2 - unsupported file format
+#   3 - conversion failed
 
-# if ~/.zaread doesn't exist, we create it.
-if [[ ! -d "$zadir" ]]; then
-  mkdir "$zadir"
-  mkdir "$zadir"cksum
-fi
+# zaread cache path
+ZA_CACHE_DIR="${XDG_CACHE_HOME:-"$HOME"/.cache}/zaread/"
+# zaread config path
+ZA_CONFIG="${XDG_CONFIG_HOME:-"$HOME"/.config}/zaread/zareadrc"
 
-# if no arguments exit.
-if [[ -z $@ ]]; then exit 1; fi
+# Default reader
+READER="zathura"
 
-# if zathura is not installed, we force the user to choose a pdf reader
-# after three wrong commands, the script exits 1
-# if the user inserts a command that exists but is not a pdf reader then... then fuck him.
-counter=0
-while [[ -z `command -v "$reader"` ]]; do
-  if [ $counter -gt 3 ]; then exit 1; fi
-  let counter+=1
-  echo "Seems that you don't have zathura installed. Please choose an installed PDF reader:"
-  read reader
+# Default converters
+MOBI_CMD="ebook-convert"
+OFFICE_CMD="soffice"
+MD_CMD="md2pdf"
+TYPST_CMD="typst"
+TYPST_ARG="compile"
+MD_ARG=""
+MOBI_ARG=""
+OFFICE_ARG=""
+
+# Verbose output (override with -v flag or set in config)
+VERBOSE=0
+
+# Override any of the above via config file
+# shellcheck disable=SC1090
+[ -f "$ZA_CONFIG" ] && . "$ZA_CONFIG"
+
+# Create cache dir if needed
+[ ! -d "$ZA_CACHE_DIR" ] && mkdir -p "$ZA_CACHE_DIR"
+
+log() {
+	if [ "$VERBOSE" -eq 1 ]; then
+		echo "$@"
+	fi
+}
+
+err() {
+	echo "zaread: $*" >&2
+}
+
+usage() {
+	echo "Usage: zaread [-v] [-c] <file>" >&2
+}
+
+while getopts "vhc" opt; do
+	case "$opt" in
+	v) VERBOSE=1 ;;
+	c)
+		if [ -d "$ZA_CACHE_DIR" ]; then
+			rm -rf "${ZA_CACHE_DIR:?}"/*
+			echo "Cache cleared: $ZA_CACHE_DIR"
+		else
+			echo "No cache directory found."
+		fi
+		exit 0
+		;;
+	h) usage; exit 0 ;;
+	*) usage; exit 1 ;;
+	esac
 done
-echo "We'll read PDF with $reader."
+shift $((OPTIND - 1))
 
-
-## create position and file variables ##
-
-# complete file name (path excluded):
-file=`echo "$@" | rev | cut -d'/' -f1 | rev`
-
-# complete directory path:
-# if it has been inserted absolute path ($@ starts with '/')
-if [[ $@ =~ ^/ ]]; then
-  directory=`echo "$@" | rev | cut -d'/' -f2- | rev`"/"
-# else (relative path inserted)
-else
-  dir=`pwd`"/"`echo "$@" | sed 's|.[^/]*$||'`"/"
-  directory=`echo "$dir" | sed 's|//|/|'`
+if [ "$#" -eq 0 ]; then
+	err "no file specified"
+	usage
+	exit 1
 fi
-echo "$directory""$file"
 
-# if file type is pdf, then just read the file
-if [[ `file "$directory""$file" | cut -d':' -f2 | cut -d' ' -f2` == "PDF"  ]]; then
-  echo "The file is already in PDF format."
-  $reader "$directory""$file"
-# else check if you already have its pdf version (if not, create it)
-else
-  pdffile=`echo "$file" | rev | cut -d'.' -f2- | rev`".pdf"
-  check=`cksum "$directory""$file" | awk '{print $1}'`
-  # if pdf version hasn't ever been created, or it changed, then
-  # make conversion and store the checksum.
-  if [[ ( ! -f "$zadir$pdffile" ) || ( ! "$check" == `cat "$zadir"cksum/"$file".check` ) ]]; then
-    # if it's a mobi file, then convert it to epub (the command depends on calibre)
-    if [[ "$file" =~ ^.*\.mobi$ ]]; then
-      ebook-converter "$directory""$file" "$directory"`echo "$file" | sed 's/mobi$/epub/'`
-    else
-      libreoffice --convert-to pdf "$directory""$file" --headless --outdir "$zadir"
-    fi
-    echo "$check" > "$zadir"cksum/"$file".check
-  fi
-  $reader "$zadir$pdffile"
+if [ "$#" -ne 1 ]; then
+	err "expected one file, got $#"
+	exit 1
 fi
+
+path="$1"
+
+if [ ! -f "$path" ]; then
+	err "file not found: $path"
+	exit 1
+fi
+
+if ! command -v "$READER" >/dev/null; then
+	err "$READER is not in PATH"
+	exit 1
+fi
+
+log "Reader: $READER"
+
+## Resolve file path
+
+file="$(basename "$path")"
+log "File: $file"
+
+case "$path" in
+/*)
+	directory="$(dirname "$path")"
+	;;
+*)
+	directory="${PWD}/$(dirname "$path")"
+	;;
+esac
+
+log "Directory: $directory"
+
+# Detect MIME type
+file_mt="$(file --mime-type "$directory/$file")"
+file_mt="${file_mt#*: }"
+log "MIME type: $file_mt"
+
+cd "$directory" || {
+	err "cannot cd into $directory"
+	exit 1
+}
+
+# Cache key: CRC_BYTECOUNT_filename.pdf
+pdffile="$(cksum "$file" | sed 's/^\([0-9]*\) \([0-9]*\) \(.*\)$/\1_\2_\3.pdf/')"
+log "Cache file: $pdffile"
+
+file_converter=""
+
+# Check for cached conversion first
+if [ -f "$ZA_CACHE_DIR/$pdffile" ]; then
+	file_converter="none_converted"
+else
+	case "$file_mt" in
+	"application/pdf" | "image/vnd.djvu" | "application/epub+zip")
+		file_converter="none_original"
+		;;
+	"application/vnd.openxmlformats-officedocument.wordprocessingml.document" | \
+		"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" | \
+		"application/vnd.openxmlformats-officedocument.presentationml.presentation" | \
+		"application/msword" | \
+		"application/vnd.ms-excel" | \
+		"application/vnd.ms-powerpoint" | \
+		"application/vnd.oasis.opendocument.text" | \
+		"application/vnd.oasis.opendocument.spreadsheet" | \
+		"application/vnd.oasis.opendocument.presentation" | \
+		"text/rtf" | \
+		"text/csv")
+		file_converter="$OFFICE_CMD"
+		;;
+	"application/octet-stream" | \
+		"application/x-mobipocket-ebook")
+		case "$file" in
+		*.mobi)
+			file_converter="$MOBI_CMD"
+			;;
+		esac
+		;;
+	# file(1) reports macro-enabled Office formats as application/zip
+	"application/zip")
+		case "$file" in
+		*.xlsm | *.xlsb | *.docm | *.pptm | *.ppsx | *.dotx)
+			file_converter="$OFFICE_CMD"
+			;;
+		esac
+		;;
+	# file(1) sometimes reports markdown/typst as C, ObjC, or Python source
+	"text/plain" | \
+		"text/x-c" | \
+		"text/x-objective-c" | \
+		"text/x-script.python")
+		case "$file" in
+		*.md)
+			file_converter="$MD_CMD"
+			;;
+		*.typ)
+			file_converter="$TYPST_CMD"
+			;;
+		esac
+		;;
+	esac
+fi
+
+case "$file_converter" in
+"")
+	err "unsupported format: $file_mt"
+	exit 2
+	;;
+"none_original")
+	log "Opening directly"
+	"$READER" "$directory/$file"
+	;;
+"none_converted")
+	log "Opening from cache"
+	"$READER" "$ZA_CACHE_DIR/$pdffile"
+	;;
+*)
+	if ! command -v "$file_converter" >/dev/null; then
+		err "$file_converter is not in PATH (needed to convert $file)"
+		exit 1
+	fi
+	log "Converting $file with $file_converter"
+	# _ARG vars intentionally unquoted to allow multi-argument values
+	case "$file_converter" in
+	"$OFFICE_CMD")
+		# shellcheck disable=SC2086
+		if ! "$OFFICE_CMD" $OFFICE_ARG --convert-to pdf "$directory/$file" --outdir "$ZA_CACHE_DIR"; then
+			err "conversion failed: $OFFICE_CMD $file"
+			exit 3
+		fi
+		# soffice names output by replacing/appending .pdf;
+		# handle dotfiles with and without extensions
+		case "$file" in
+		.*.*)
+			tmpfile="${file%.*}.pdf"
+			;;
+		.*)
+			tmpfile="$file.pdf"
+			;;
+		*)
+			tmpfile="${file%.*}.pdf"
+			;;
+		esac
+		mv "$ZA_CACHE_DIR/$tmpfile" "$ZA_CACHE_DIR/$pdffile"
+		;;
+	"$MOBI_CMD")
+		# shellcheck disable=SC2086
+		if ! "$MOBI_CMD" $MOBI_ARG "$directory/$file" "$ZA_CACHE_DIR/$pdffile"; then
+			err "conversion failed: $MOBI_CMD $file"
+			exit 3
+		fi
+		;;
+	"$MD_CMD")
+		# shellcheck disable=SC2086
+		if ! "$MD_CMD" $MD_ARG "$directory/$file" -o "$ZA_CACHE_DIR/$pdffile"; then
+			err "conversion failed: $MD_CMD $file"
+			exit 3
+		fi
+		;;
+	"$TYPST_CMD")
+		# shellcheck disable=SC2086
+		if ! "$TYPST_CMD" $TYPST_ARG "$directory/$file" "$ZA_CACHE_DIR/$pdffile" --open "$READER"; then
+			err "conversion failed: $TYPST_CMD $file"
+			exit 3
+		fi
+		exit
+		;;
+	esac
+	log "Opening converted file"
+	"$READER" "$ZA_CACHE_DIR/$pdffile"
+	;;
+esac
